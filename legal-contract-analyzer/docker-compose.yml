@@ -1,0 +1,17 @@
+version: "3.9"
+
+services:
+  app:
+    build: .
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    volumes:
+      # Persist the vector index across container restarts.
+      # Without this, build_index.py must re-run on every docker compose up.
+      - ./vectorstore:/app/vectorstore
+      # Persist generated reports and logs
+      - ./data:/app/data
+      - ./logs:/app/logs
+    restart: unless-stopped
