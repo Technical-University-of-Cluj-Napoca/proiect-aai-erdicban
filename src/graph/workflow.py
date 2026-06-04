@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import TypedDict, Optional, Any
 
 from langgraph.graph import StateGraph, END
+from langchain_community.callbacks.manager import get_openai_callback
 
 from src.agents.parser_agent import DocumentParserAgent
 from src.agents.retrieval_agent import RAGRetrievalAgent
@@ -48,7 +49,8 @@ from src.dtos import (
 logger = logging.getLogger(__name__)
 
 MAX_ITER = 2
-NECUNOSCUT_THRESHOLD = 0.40   # fraction of NECUNOSCUT clauses that triggers retry
+# fraction of NECUNOSCUT clauses that triggers retry
+NECUNOSCUT_THRESHOLD = 0.40   
 PERSIST_DIR = os.getenv("VECTORSTORE_DIR", "vectorstore")
 
 
@@ -90,12 +92,15 @@ def _initial_state(pdf_path: str) -> WorkflowState:
 # Node helpers
 # ──────────────────────────────────────────────
 
-def _log_node(state: WorkflowState, node: str, start: float, **extra) -> None:
+def _log_node(state: WorkflowState, node: str, start: float, prompt_tokens: int = 0, completion_tokens: int = 0, total_tokens: int = 0, **extra) -> None:
     state["node_log"].append(
         {
             "node": node,
             "duration_s": round(time.time() - start, 2),
             "iteration": state["iteration"],
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
             **extra,
         }
     )
@@ -108,10 +113,19 @@ def _log_node(state: WorkflowState, node: str, start: float, **extra) -> None:
 def parse_document(state: WorkflowState) -> WorkflowState:
     start = time.time()
     agent = DocumentParserAgent()
-    parsed = agent.parse(state["pdf_path"])
+    
+    with get_openai_callback() as cb:
+        parsed = agent.parse(state["pdf_path"])
+        p_tok = cb.prompt_tokens
+        c_tok = cb.completion_tokens
+        t_tok = cb.total_tokens
+        
     state["parsed_doc"] = parsed
     _log_node(
         state, "parse_document", start,
+        prompt_tokens=p_tok,
+        completion_tokens=c_tok,
+        total_tokens=t_tok,
         sections=len(parsed.sections),
         clauses=len(parsed.clauses),
     )
@@ -127,14 +141,16 @@ def retrieve_context(state: WorkflowState) -> WorkflowState:
     )
     parsed = state["parsed_doc"]
 
-    # Bonus: parallel retrieval — all clauses retrieved simultaneously via thread pool.
-    # Cuts retrieval wall-time by ~60-70% on contracts with many clauses.
+    # Parallel retrieval
     context_map = agent.retrieve_many(parsed.clauses, k=state["retrieval_k"])
 
     state["context_map"] = context_map
     empty_count = sum(1 for v in context_map.values() if not v)
     _log_node(
         state, "retrieve_context", start,
+        prompt_tokens=0,
+        completion_tokens=0,
+        total_tokens=0,
         total_clauses=len(parsed.clauses),
         empty_retrievals=empty_count,
         k=state["retrieval_k"],
@@ -155,17 +171,27 @@ def assess_risk(state: WorkflowState) -> WorkflowState:
     agent = RiskAssessmentAgent()
     risk_map: dict[str, RiskAssessmentDTO] = {}
 
-    for clause in state["parsed_doc"].clauses:
-        chunks = state["context_map"].get(clause.id, [])
-        assessment = agent.assess(clause, chunks)
-        risk_map[clause.id] = assessment
+    with get_openai_callback() as cb:
+        for clause in state["parsed_doc"].clauses:
+            chunks = state["context_map"].get(clause.id, [])
+            assessment = agent.assess(clause, chunks)
+            risk_map[clause.id] = assessment
+        p_tok = cb.prompt_tokens
+        c_tok = cb.completion_tokens
+        t_tok = cb.total_tokens
 
     state["risk_map"] = risk_map
     counts = {level.value: 0 for level in RiskLevel}
     for a in risk_map.values():
         counts[a.risk_level.value] += 1
 
-    _log_node(state, "assess_risk", start, risk_distribution=counts)
+    _log_node(
+        state, "assess_risk", start,
+        prompt_tokens=p_tok,
+        completion_tokens=c_tok,
+        total_tokens=t_tok,
+        risk_distribution=counts
+    )
     logger.info("[assess_risk] distribution: %s", counts)
     return state
 
@@ -210,7 +236,13 @@ def flag_high_risk(state: WorkflowState) -> WorkflowState:
         1 for a in state["risk_map"].values() if a.risk_level == RiskLevel.RIDICAT
     )
     state["high_risk_alert"] = high_risk_count > 0
-    _log_node(state, "flag_high_risk", start, high_risk_clauses=high_risk_count)
+    _log_node(
+        state, "flag_high_risk", start,
+        prompt_tokens=0,
+        completion_tokens=0,
+        total_tokens=0,
+        high_risk_clauses=high_risk_count
+    )
     if state["high_risk_alert"]:
         logger.warning("[flag_high_risk] %d RIDICAT clause(s) detected!", high_risk_count)
     return state
@@ -222,18 +254,25 @@ def generate_recommendations(state: WorkflowState) -> WorkflowState:
     recommendations: list[RecommendationDTO] = []
 
     clause_map = {c.id: c for c in state["parsed_doc"].clauses}
-    for clause_id, risk in state["risk_map"].items():
-        clause = clause_map.get(clause_id)
-        if not clause:
-            continue
-        chunks = state["context_map"].get(clause_id, [])
-        rec = agent.recommend(clause, risk, chunks)
-        recommendations.append(rec)
+    with get_openai_callback() as cb:
+        for clause_id, risk in state["risk_map"].items():
+            clause = clause_map.get(clause_id)
+            if not clause:
+                continue
+            chunks = state["context_map"].get(clause_id, [])
+            rec = agent.recommend(clause, risk, chunks)
+            recommendations.append(rec)
+        p_tok = cb.prompt_tokens
+        c_tok = cb.completion_tokens
+        t_tok = cb.total_tokens
 
     state["recommendations"] = recommendations
     reformulated = sum(1 for r in recommendations if r.reformulated_text)
     _log_node(
         state, "generate_recommendations", start,
+        prompt_tokens=p_tok,
+        completion_tokens=c_tok,
+        total_tokens=t_tok,
         total=len(recommendations),
         reformulated=reformulated,
     )
@@ -273,7 +312,13 @@ def compile_report(state: WorkflowState) -> WorkflowState:
     # Write run log
     os.makedirs("logs", exist_ok=True)
     log_path = f"logs/run_{timestamp}.json"
-    _log_node(state, "compile_report", start, report_path=report_path)
+    _log_node(
+        state, "compile_report", start,
+        prompt_tokens=0,
+        completion_tokens=0,
+        total_tokens=0,
+        report_path=report_path
+    )
     with open(log_path, "w", encoding="utf-8") as f:
         json.dump(state["node_log"], f, ensure_ascii=False, indent=2)
 
