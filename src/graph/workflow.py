@@ -135,6 +135,20 @@ def parse_document(state: WorkflowState) -> WorkflowState:
 
 def retrieve_context(state: WorkflowState) -> WorkflowState:
     start = time.time()
+
+    # If this is a retry (risk_map has been populated from a previous iteration),
+    # increment iteration and adjust parameters in the persistent state.
+    if state.get("risk_map"):
+        state["iteration"] += 1
+        state["retrieval_k"] += 3
+        state["retrieval_threshold"] = max(0.10, state["retrieval_threshold"] - 0.10)
+        logger.info(
+            "[retrieve_context] Retry triggered. Adjusting parameters: iter=%d, k=%d, thr=%.2f",
+            state["iteration"],
+            state["retrieval_k"],
+            state["retrieval_threshold"],
+        )
+
     agent = RAGRetrievalAgent(
         persist_directory=PERSIST_DIR,
         threshold=state["retrieval_threshold"],
@@ -210,15 +224,10 @@ def quality_check(state: WorkflowState) -> str:
     ) / len(risk_map)
 
     if necunoscut_frac > NECUNOSCUT_THRESHOLD and state["iteration"] < MAX_ITER:
-        state["iteration"] += 1
-        state["retrieval_k"] += 3
-        state["retrieval_threshold"] = max(0.10, state["retrieval_threshold"] - 0.10)
         logger.info(
-            "[quality_check] %.0f%% NECUNOSCUT → retry (iter=%d, k=%d, thr=%.2f)",
+            "[quality_check] %.0f%% NECUNOSCUT → routing back to retrieve_context (current iter=%d)",
             necunoscut_frac * 100,
             state["iteration"],
-            state["retrieval_k"],
-            state["retrieval_threshold"],
         )
         return "retrieve_context"
 
