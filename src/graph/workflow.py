@@ -185,14 +185,32 @@ def assess_risk(state: WorkflowState) -> WorkflowState:
     agent = RiskAssessmentAgent()
     risk_map: dict[str, RiskAssessmentDTO] = {}
 
-    with get_openai_callback() as cb:
-        for clause in state["parsed_doc"].clauses:
-            chunks = state["context_map"].get(clause.id, [])
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    total_total_tokens = 0
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    def assess_single(clause):
+        chunks = state["context_map"].get(clause.id, [])
+        with get_openai_callback() as cb:
             assessment = agent.assess(clause, chunks)
-            risk_map[clause.id] = assessment
-        p_tok = cb.prompt_tokens
-        c_tok = cb.completion_tokens
-        t_tok = cb.total_tokens
+            return clause.id, assessment, cb.prompt_tokens, cb.completion_tokens, cb.total_tokens
+
+    clauses = state["parsed_doc"].clauses
+    max_workers = min(8, len(clauses)) if clauses else 1
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(assess_single, clause) for clause in clauses]
+        for fut in futures:
+            try:
+                cid, assessment, p_tok, c_tok, t_tok = fut.result()
+                risk_map[cid] = assessment
+                total_prompt_tokens += p_tok
+                total_completion_tokens += c_tok
+                total_total_tokens += t_tok
+            except Exception as exc:
+                logger.error("Error in parallel risk assessment: %s", exc)
 
     state["risk_map"] = risk_map
     counts = {level.value: 0 for level in RiskLevel}
@@ -201,9 +219,9 @@ def assess_risk(state: WorkflowState) -> WorkflowState:
 
     _log_node(
         state, "assess_risk", start,
-        prompt_tokens=p_tok,
-        completion_tokens=c_tok,
-        total_tokens=t_tok,
+        prompt_tokens=total_prompt_tokens,
+        completion_tokens=total_completion_tokens,
+        total_tokens=total_total_tokens,
         risk_distribution=counts
     )
     logger.info("[assess_risk] distribution: %s", counts)
@@ -262,26 +280,44 @@ def generate_recommendations(state: WorkflowState) -> WorkflowState:
     agent = RecommendationAgent()
     recommendations: list[RecommendationDTO] = []
 
+    from concurrent.futures import ThreadPoolExecutor
+
     clause_map = {c.id: c for c in state["parsed_doc"].clauses}
-    with get_openai_callback() as cb:
-        for clause_id, risk in state["risk_map"].items():
-            clause = clause_map.get(clause_id)
-            if not clause:
-                continue
-            chunks = state["context_map"].get(clause_id, [])
+    items_to_process = []
+    for clause_id, risk in state["risk_map"].items():
+        clause = clause_map.get(clause_id)
+        if not clause:
+            continue
+        chunks = state["context_map"].get(clause_id, [])
+        items_to_process.append((clause, risk, chunks))
+
+    def recommend_single(item):
+        clause, risk, chunks = item
+        with get_openai_callback() as cb:
             rec = agent.recommend(clause, risk, chunks)
-            recommendations.append(rec)
-        p_tok = cb.prompt_tokens
-        c_tok = cb.completion_tokens
-        t_tok = cb.total_tokens
+            return rec, cb.prompt_tokens, cb.completion_tokens, cb.total_tokens
+
+    max_workers = min(8, len(items_to_process)) if items_to_process else 1
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(recommend_single, item) for item in items_to_process]
+        for fut in futures:
+            try:
+                rec, p_tok, c_tok, t_tok = fut.result()
+                recommendations.append(rec)
+                total_prompt_tokens += p_tok
+                total_completion_tokens += c_tok
+                total_total_tokens += t_tok
+            except Exception as exc:
+                logger.error("Error in parallel recommendations: %s", exc)
 
     state["recommendations"] = recommendations
     reformulated = sum(1 for r in recommendations if r.reformulated_text)
     _log_node(
         state, "generate_recommendations", start,
-        prompt_tokens=p_tok,
-        completion_tokens=c_tok,
-        total_tokens=t_tok,
+        prompt_tokens=total_prompt_tokens,
+        completion_tokens=total_completion_tokens,
+        total_tokens=total_total_tokens,
         total=len(recommendations),
         reformulated=reformulated,
     )
