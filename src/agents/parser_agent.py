@@ -88,7 +88,7 @@ def _extract_sections_from_pages(pages_text: list[str]) -> list[SectionDTO]:
     seen_titles: set[str] = set()
     # Matches Roman numerals like I. II. III. IV. V. VI. at start of line
     pattern = re.compile(
-        r"^(Articolul\s+\d+|Art\.\s*\d+|Clauza\s+\d+|CAPITOLUL\s+[IVXLCDM\d]+|^[IVXLCDM]+\.\s+[A-ZĂÂÎȘȚa-z\s]+)",
+        r"^(Articolul\s+\d+|Art\.\s*\d+|Clauza\s+\d+|CAPITOLUL\s+[IVXLCDM\d]+|^[IVXLCDM]+\.\s+[A-ZĂÂÎȘȚa-z\t ]+)",
         re.IGNORECASE | re.MULTILINE,
     )
     for page_num, page_text in enumerate(pages_text, start=1):
@@ -112,15 +112,9 @@ def _extract_clauses_from_text(
     """
     clauses: list[ClauseDTO] = []
     clause_counter: dict[str, int] = {}
-
-    # Map section titles to start pages
-    section_map: dict[int, str] = {s.start_page: s.title for s in sections}
     current_section = "Preambul"
 
     for page_num, page_text in enumerate(pages_text, start=1):
-        if page_num in section_map:
-            current_section = section_map[page_num]
-
         # Normalize line endings
         text = page_text.replace("\r\n", "\n")
 
@@ -149,13 +143,25 @@ def _extract_clauses_from_text(
                     processed_paragraphs.append(p_clean)
 
         for para in processed_paragraphs:
-            # Skip page headers or section title lines if they match exactly
-            if any(para == s.title for s in sections):
+            # Check if this paragraph is a section header (fuzzy match to account for extraction noise)
+            matched_section = None
+            for s in sections:
+                if para.lower() in s.title.lower() or s.title.lower() in para.lower():
+                    matched_section = s.title
+                    break
+            
+            if matched_section:
+                current_section = matched_section
+                # Skip adding the section title itself as a clause
                 continue
 
             section_key = current_section[:20]
             clause_counter[section_key] = clause_counter.get(section_key, 0) + 1
-            clause_id = f"sec_{section_key[:8].replace(' ', '_').replace('.', '')}_clz_{clause_counter[section_key]:03d}"
+            
+            clean_sec_key = re.sub(r"[^a-zA-Z0-9_]", "", section_key[:12].replace(" ", "_"))
+            if not clean_sec_key:
+                clean_sec_key = "clz"
+            clause_id = f"sec_{clean_sec_key}_clz_{clause_counter[section_key]:03d}"
 
             # Keyword classification
             clause_type = _classify_clause_by_keywords(para)
