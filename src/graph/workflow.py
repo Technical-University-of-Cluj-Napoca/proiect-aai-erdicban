@@ -280,6 +280,10 @@ def generate_recommendations(state: WorkflowState) -> WorkflowState:
     agent = RecommendationAgent()
     recommendations: list[RecommendationDTO] = []
 
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    total_total_tokens = 0
+
     from concurrent.futures import ThreadPoolExecutor
 
     clause_map = {c.id: c for c in state["parsed_doc"].clauses}
