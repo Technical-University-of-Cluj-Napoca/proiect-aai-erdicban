@@ -8,6 +8,8 @@ on every Streamlit interaction (slider move, expander click, etc.).
 """
 
 from __future__ import annotations
+import warnings
+warnings.filterwarnings("ignore")
 import sys
 import os
 import time
