@@ -8,8 +8,6 @@ on every Streamlit interaction (slider move, expander click, etc.).
 """
 
 from __future__ import annotations
-import json
-import logging
 import os
 import time
 from pathlib import Path
@@ -26,16 +24,8 @@ st.set_page_config(
     layout="wide",
 )
 
-from src.agents.parser_agent import DocumentParserAgent
-from src.agents.retrieval_agent import RAGRetrievalAgent
-from src.agents.risk_agent import RiskAssessmentAgent
-from src.agents.recommendation_agent import RecommendationAgent
-from src.dtos import RiskLevel
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("app")
-
-VECTORSTORE_DIR = os.getenv("VECTORSTORE_DIR", "vectorstore")
+from src.dtos import RiskLevel, RecommendationDTO
+from src.graph.workflow import build_graph
 
 # ── Risk colour palette ──
 RISK_COLORS = {
@@ -123,83 +113,59 @@ if analyze_btn or (cache_key not in st.session_state):
     status = st.empty()
 
     try:
-        # Step 1: Parse
-        status.info("📄 Parsare document... (Pasul 1/4)")
-        progress.progress(10)
-        parser = DocumentParserAgent()
-        parsed_doc = parser.parse(str(tmp_path))
-        progress.progress(25)
+        # Build LangGraph workflow
+        graph = build_graph()
+        app = graph.compile()
 
-        # Step 2: Retrieve
-        status.info("🔍 Recuperare context juridic... (Pasul 2/4)")
-        retrieval_agent = RAGRetrievalAgent(
-            persist_directory=VECTORSTORE_DIR,
-            threshold=retrieval_threshold,
-        )
-        context_map = {}
-        for i, clause in enumerate(parsed_doc.clauses):
-            context_map[clause.id] = retrieval_agent.retrieve(clause)
-            progress.progress(25 + int(25 * i / max(len(parsed_doc.clauses), 1)))
-
-        # Step 3: Risk assessment
-        status.info("⚠️ Evaluare riscuri... (Pasul 3/4)")
-        risk_agent = RiskAssessmentAgent()
-        risk_map = {}
-        for i, clause in enumerate(parsed_doc.clauses):
-            chunks = context_map.get(clause.id, [])
-            risk_map[clause.id] = risk_agent.assess(clause, chunks)
-            progress.progress(50 + int(25 * i / max(len(parsed_doc.clauses), 1)))
-
-        # Step 4: Recommendations
-        status.info("📝 Generare recomandări... (Pasul 4/4)")
-        rec_agent = RecommendationAgent()
-        recommendations = {}
-        risky_clauses = [
-            c for c in parsed_doc.clauses
-            if risk_map[c.id].risk_level in (RiskLevel.RIDICAT, RiskLevel.MEDIU)
-        ]
-        for i, clause in enumerate(risky_clauses):
-            risk = risk_map[clause.id]
-            chunks = context_map.get(clause.id, [])
-            recommendations[clause.id] = rec_agent.recommend(clause, risk, chunks)
-            progress.progress(75 + int(20 * i / max(len(risky_clauses), 1)))
-
-        # Generate and save report
-        clause_map = {c.id: c for c in parsed_doc.clauses}
-        results_for_report = [
-            (clause_map[cid], risk, recommendations.get(cid))
-            for cid, risk in risk_map.items()
-            if cid in clause_map
-        ]
-        # Filter out None recommendations
-        results_for_report = [
-            (c, r, rec) for c, r, rec in results_for_report if rec is not None
-        ]
-
-        from src.dtos import RecommendationDTO
-        full_results = []
-        for clause in parsed_doc.clauses:
-            risk = risk_map[clause.id]
-            rec = recommendations.get(clause.id, RecommendationDTO(
-                clause_id=clause.id,
-                original_text=clause.text,
-            ))
-            full_results.append((clause, risk, rec))
-
-        import os
-        os.makedirs("data", exist_ok=True)
-        report_path = f"data/report_{uploaded_file.name.replace('.pdf', '')}.md"
-        rec_agent.generate_report(full_results, report_path)
-
-        # Cache results
-        st.session_state[cache_key] = {
-            "parsed_doc": parsed_doc,
-            "risk_map": risk_map,
-            "recommendations": recommendations,
-            "report_path": report_path,
+        # Set up initial state
+        initial_state = {
+            "pdf_path": str(tmp_path),
+            "parsed_doc": None,
+            "context_map": {},
+            "risk_map": {},
+            "high_risk_alert": False,
+            "recommendations": [],
+            "report_path": "",
+            "iteration": 0,
+            "retrieval_k": 5,
+            "retrieval_threshold": retrieval_threshold,
+            "node_log": [],
         }
 
-        progress.progress(100)
+        # Stream execution to update the UI progress progressively
+        state = initial_state.copy()
+        for event in app.stream(initial_state):
+            for node_name, updated_values in event.items():
+                state.update(updated_values)
+                
+                if node_name == "parse_document":
+                    status.info("📄 Parsare document... (Pasul 1/5)")
+                    progress.progress(20)
+                elif node_name == "retrieve_context":
+                    status.info("🔍 Recuperare context juridic... (Pasul 2/5)")
+                    progress.progress(40)
+                elif node_name == "assess_risk":
+                    status.info("⚠️ Evaluare riscuri... (Pasul 3/5)")
+                    progress.progress(60)
+                elif node_name == "flag_high_risk":
+                    status.info("🚨 Verificare alerte risc ridicat... (Pasul 4/5)")
+                    progress.progress(85)
+                elif node_name == "generate_recommendations":
+                    status.info("📝 Generare recomandări... (Pasul 5/5)")
+                    progress.progress(95)
+                elif node_name == "compile_report":
+                    status.info("📊 Compilare raport final...")
+                    progress.progress(100)
+
+        # Cache results in expected format
+        st.session_state[cache_key] = {
+            "parsed_doc": state["parsed_doc"],
+            "risk_map": state["risk_map"],
+            "recommendations": {r.clause_id: r for r in state["recommendations"]},
+            "report_path": state["report_path"],
+            "high_risk_alert": state["high_risk_alert"],
+        }
+
         status.success("✅ Analiză completă!")
         time.sleep(0.5)
         status.empty()
@@ -207,7 +173,6 @@ if analyze_btn or (cache_key not in st.session_state):
 
     except Exception as exc:
         st.error(f"Eroare la analiză: {exc}")
-        logger.exception("Pipeline error")
         st.stop()
 
 # ── Display results ──
@@ -219,14 +184,15 @@ parsed_doc = data["parsed_doc"]
 risk_map = data["risk_map"]
 recommendations = data["recommendations"]
 report_path = data["report_path"]
+high_risk_alert = data.get("high_risk_alert", False)
 
-# High-risk banner
+# High-risk banner (Modified to warning as per guidelines)
 high_risk_count = sum(1 for r in risk_map.values() if r.risk_level == RiskLevel.RIDICAT)
-if high_risk_count >= risk_alert_threshold:
-    st.error(
+if high_risk_alert or high_risk_count >= risk_alert_threshold:
+    st.warning(
         f"🚨 **ATENȚIE**: Au fost detectate **{high_risk_count} clauze cu risc RIDICAT**. "
         "Consultați un jurist înainte de semnare.",
-        icon="🚨",
+        icon="⚠️",
     )
 
 # Contract metadata
@@ -319,8 +285,8 @@ if Path(report_path).exists():
 # Persistent disclaimer at the bottom
 st.markdown("---")
 st.warning(
-    "**⚠️ Disclaimer important**: Acest sistem este un instrument de suport, nu un înlocuitor "
-    "al consultanței juridice profesionale. Toate recomandările trebuie verificate de un avocat "
-    "calificat. Sistemul poate genera erori sau omisiuni.",
-    icon="⚠️",
+        "**⚠️ Disclaimer important**: Acest sistem este un instrument de suport, nu un înlocuitor "
+        "al consultanței juridice profesionale. Toate recomandările trebuie verificate de un avocat "
+        "calificat. Sistemul poate genera erori sau omisiuni.",
+        icon="⚠️",
 )
