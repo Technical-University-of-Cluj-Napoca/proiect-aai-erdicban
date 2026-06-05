@@ -8,9 +8,13 @@ on every Streamlit interaction (slider move, expander click, etc.).
 """
 
 from __future__ import annotations
+import sys
 import os
 import time
 from pathlib import Path
+
+# Add project root to python path to resolve 'src' imports
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import streamlit as st
 from dotenv import load_dotenv
