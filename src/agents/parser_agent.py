@@ -8,11 +8,10 @@ whatever could be extracted, with empty lists for missing fields.
 Extraction strategy:
   - Metadata (title, parties, dates, value): regex on first 3 pages,
     LLM fallback for anything not matched.
-  - Section detection: pdfplumber font-size heuristic (bold/larger text)
-    combined with regex for Romanian legal patterns like "Articolul N".
-  - Clause extraction: each paragraph under a section becomes a ClauseDTO.
+  - Section detection: regex for Romanian legal patterns and Roman numerals (e.g. "I. PARTI").
+  - Clause extraction: splits by paragraph and bullet points.
   - Clause type classification: keyword matching first (fast, free),
-    LLM only for clauses that keyword matching cannot classify.
+    LLM fallback for unclassified clauses.
 """
 
 from __future__ import annotations
@@ -41,9 +40,9 @@ logger = logging.getLogger(__name__)
 # Keyword → ClauseType mapping (first-pass classification)
 # ──────────────────────────────────────────────
 CLAUSE_KEYWORDS: dict[ClauseType, list[str]] = {
-    ClauseType.PENALITATE: ["penalitate", "daune", "penalizare", "dobândă", "întârziere"],
-    ClauseType.OBLIGATIE: ["se obligă", "obligația", "trebuie să", "va asigura"],
-    ClauseType.DREPT: ["are dreptul", "dreptul de", "poate solicita"],
+    ClauseType.PENALITATE: ["penalitate", "daune", "penalizare", "dobândă", "întârziere", "majorări"],
+    ClauseType.OBLIGATIE: ["se obligă", "obligația", "trebuie să", "va asigura", "îndatoriri"],
+    ClauseType.DREPT: ["are dreptul", "dreptul de", "poate solicita", "este îndreptățit"],
     ClauseType.FORTA_MAJORA: ["forță majoră", "caz fortuit", "eveniment imprevizibil"],
     ClauseType.CONFIDENTIALITATE: ["confidențial", "secret comercial", "nedivulgare", "NDA"],
     ClauseType.REZILIERE: ["reziliere", "rezoluțiune", "încetare", "denunțare"],
@@ -59,21 +58,45 @@ def _classify_clause_by_keywords(text: str) -> ClauseType:
     return ClauseType.ALTELE
 
 
+def _classify_clause_with_llm(text: str, llm: ChatOpenAI) -> ClauseType:
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", (
+            "Ești un asistent juridic. Clasifică clauza contractuală furnizată în una dintre categoriile: "
+            "penalitate, obligatie, drept, forta_majora, confidentialitate, reziliere, date_personale, altele. "
+            "Răspunde EXCLUSIV cu numele categoriei exact cum este scrisă mai sus, fără alte cuvinte sau semne."
+        )),
+        ("human", "Clauza: {text}"),
+    ])
+    chain = prompt | llm
+    try:
+        response = chain.invoke({"text": text[:1000]})
+        val = response.content.strip().lower()
+        for ct in ClauseType:
+            if ct.value == val:
+                return ct
+    except Exception as exc:
+        logger.warning("LLM clause classification failed: %s", exc)
+    return ClauseType.ALTELE
+
+
 def _extract_sections_from_pages(pages_text: list[str]) -> list[SectionDTO]:
     """
-    Detect section headers using Romanian legal article patterns.
-    Pattern covers: 'Articolul 5', 'Art. 5', 'Clauza 3', 'CAPITOLUL II'
+    Detect section headers using Romanian legal article patterns and Roman numerals.
+    Matches: 'Articolul 5', 'Art. 5', 'Clauza 3', 'CAPITOLUL II', 'I. PARTILE CONTRACTANTE'
     """
     sections = []
     seen_titles: set[str] = set()
+    # Matches Roman numerals like I. II. III. IV. V. VI. at start of line
     pattern = re.compile(
-        r"^(Articolul\s+\d+|Art\.\s*\d+|Clauza\s+\d+|CAPITOLUL\s+[IVXLCDM\d]+)",
+        r"^(Articolul\s+\d+|Art\.\s*\d+|Clauza\s+\d+|CAPITOLUL\s+[IVXLCDM\d]+|^[IVXLCDM]+\.\s+[A-ZĂÂÎȘȚa-z\s]+)",
         re.IGNORECASE | re.MULTILINE,
     )
     for page_num, page_text in enumerate(pages_text, start=1):
         for match in pattern.finditer(page_text):
             title = match.group(0).strip()
-            if title not in seen_titles:
+            # Clean up title
+            title = re.sub(r"\s+", " ", title)
+            if title not in seen_titles and len(title) > 3:
                 sections.append(SectionDTO(title=title, start_page=page_num))
                 seen_titles.add(title)
     return sections
@@ -82,15 +105,15 @@ def _extract_sections_from_pages(pages_text: list[str]) -> list[SectionDTO]:
 def _extract_clauses_from_text(
     pages_text: list[str],
     sections: list[SectionDTO],
+    llm: ChatOpenAI,
 ) -> list[ClauseDTO]:
     """
-    Split each page into paragraphs and assign them to their section.
-    Paragraphs shorter than 30 characters are skipped (likely headers/footers).
+    Split text into clauses, accounting for newlines, bullet points and sections.
     """
     clauses: list[ClauseDTO] = []
     clause_counter: dict[str, int] = {}
 
-    # Map section titles to page numbers for assignment
+    # Map section titles to start pages
     section_map: dict[int, str] = {s.start_page: s.title for s in sections}
     current_section = "Preambul"
 
@@ -98,13 +121,49 @@ def _extract_clauses_from_text(
         if page_num in section_map:
             current_section = section_map[page_num]
 
-        paragraphs = [p.strip() for p in page_text.split("\n\n") if len(p.strip()) > 30]
-        for para in paragraphs:
+        # Normalize line endings
+        text = page_text.replace("\r\n", "\n")
+
+        # Smart splitting: split on double newlines
+        raw_paragraphs = text.split("\n\n")
+        
+        # If there are no double newlines, split by single newlines
+        if len(raw_paragraphs) <= 1:
+            raw_paragraphs = text.split("\n")
+
+        processed_paragraphs = []
+        for p in raw_paragraphs:
+            p_clean = p.strip()
+            if not p_clean:
+                continue
+            
+            # If paragraph contains bullet points, split by bullet points
+            if "•" in p_clean:
+                bullets = [b.strip() for b in p_clean.split("•") if len(b.strip()) > 10]
+                processed_paragraphs.extend(bullets)
+            elif "\n•" in p_clean or "\n-" in p_clean:
+                bullets = [b.strip() for b in re.split(r"\n[•-]", p_clean) if len(b.strip()) > 10]
+                processed_paragraphs.extend(bullets)
+            else:
+                if len(p_clean) > 20:
+                    processed_paragraphs.append(p_clean)
+
+        for para in processed_paragraphs:
+            # Skip page headers or section title lines if they match exactly
+            if any(para == s.title for s in sections):
+                continue
+
             section_key = current_section[:20]
             clause_counter[section_key] = clause_counter.get(section_key, 0) + 1
-            clause_id = f"sec_{section_key[:8].replace(' ', '_')}_clz_{clause_counter[section_key]:03d}"
+            clause_id = f"sec_{section_key[:8].replace(' ', '_').replace('.', '')}_clz_{clause_counter[section_key]:03d}"
 
+            # Keyword classification
             clause_type = _classify_clause_by_keywords(para)
+            
+            # LLM fallback if keyword classification returns ALTELE
+            if clause_type == ClauseType.ALTELE:
+                clause_type = _classify_clause_with_llm(para, llm)
+
             clauses.append(
                 ClauseDTO(
                     id=clause_id,
@@ -121,11 +180,10 @@ def _extract_clauses_from_text(
 def _extract_metadata_with_regex(first_pages_text: str) -> dict:
     """
     Fast regex extraction for predictable fields.
-    Returns a partial dict — missing fields will be filled by LLM fallback.
     """
     result: dict = {}
 
-    # Signing date: common Romanian patterns
+    # Signing date
     date_match = re.search(
         r"(\d{1,2}[./]\d{1,2}[./]\d{4}|\d{4}-\d{2}-\d{2})", first_pages_text
     )
@@ -148,7 +206,6 @@ def _extract_metadata_with_regex(first_pages_text: str) -> dict:
 def _extract_metadata_with_llm(first_pages_text: str, llm: ChatOpenAI) -> dict:
     """
     LLM fallback for metadata fields regex could not extract.
-    Returns JSON with keys: title, parties, signing_date, effective_date, value, duration.
     """
     prompt = ChatPromptTemplate.from_messages([
         ("system", (
@@ -165,7 +222,6 @@ def _extract_metadata_with_llm(first_pages_text: str, llm: ChatOpenAI) -> dict:
     try:
         response = chain.invoke({"text": first_pages_text[:3000]})
         raw = response.content.strip()
-        # Strip markdown fences if present
         raw = re.sub(r"```json|```", "", raw).strip()
         return json.loads(raw)
     except Exception as exc:
@@ -192,7 +248,6 @@ class DocumentParserAgent:
     def parse(self, pdf_path: str | Path) -> ParsedDocumentDTO:
         """
         Main entry point. Returns ParsedDocumentDTO even on partial failure.
-        If the PDF cannot be opened at all, returns a DTO with empty clauses.
         """
         pdf_path = Path(pdf_path)
         logger.info("Parsing contract: %s", pdf_path)
@@ -217,14 +272,12 @@ class DocumentParserAgent:
                 clauses=[],
             )
 
-        full_text = "\n\n".join(pages_text)
         first_pages_text = "\n\n".join(pages_text[:3])
 
         # ── Metadata extraction ──
         regex_meta = _extract_metadata_with_regex(first_pages_text)
         llm_meta = _extract_metadata_with_llm(first_pages_text, self.llm)
 
-        # Merge: regex wins for fields it found (more reliable), LLM fills the rest
         parties_raw = llm_meta.get("parties", [])
         parties = [
             PartyDTO(
@@ -248,7 +301,7 @@ class DocumentParserAgent:
 
         # ── Structure extraction ──
         sections = _extract_sections_from_pages(pages_text)
-        clauses = _extract_clauses_from_text(pages_text, sections)
+        clauses = _extract_clauses_from_text(pages_text, sections, self.llm)
 
         logger.info(
             "Parsed %s: %d pages, %d sections, %d clauses",
