@@ -262,13 +262,11 @@ class DocumentParserAgent:
         page_count = 0
 
         try:
-            with pdfplumber.open(pdf_path) as pdf:
-                page_count = len(pdf.pages)
-                for page in pdf.pages:
-                    text = page.extract_text() or ""
-                    pages_text.append(text)
+            from src.tools.pdf_tools import extract_text_with_ocr_fallback
+            pages_text = extract_text_with_ocr_fallback(pdf_path)
+            page_count = len(pages_text)
         except Exception as exc:
-            logger.error("Failed to open PDF %s: %s", pdf_path, exc)
+            logger.error("Failed to open or parse PDF %s: %s", pdf_path, exc)
             return ParsedDocumentDTO(
                 metadata=DocumentMetadataDTO(
                     title=pdf_path.stem,
