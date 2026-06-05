@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import TypedDict, Optional, Any
 
 from langgraph.graph import StateGraph, END
+from langchain_community.callbacks.manager import get_openai_callback
 
 from src.agents.parser_agent import DocumentParserAgent
 from src.agents.retrieval_agent import RAGRetrievalAgent
@@ -48,7 +49,8 @@ from src.dtos import (
 logger = logging.getLogger(__name__)
 
 MAX_ITER = 2
-NECUNOSCUT_THRESHOLD = 0.40   # fraction of NECUNOSCUT clauses that triggers retry
+# fraction of NECUNOSCUT clauses that triggers retry
+NECUNOSCUT_THRESHOLD = 0.40   
 PERSIST_DIR = os.getenv("VECTORSTORE_DIR", "vectorstore")
 
 
@@ -90,12 +92,15 @@ def _initial_state(pdf_path: str) -> WorkflowState:
 # Node helpers
 # ──────────────────────────────────────────────
 
-def _log_node(state: WorkflowState, node: str, start: float, **extra) -> None:
+def _log_node(state: WorkflowState, node: str, start: float, prompt_tokens: int = 0, completion_tokens: int = 0, total_tokens: int = 0, **extra) -> None:
     state["node_log"].append(
         {
             "node": node,
             "duration_s": round(time.time() - start, 2),
             "iteration": state["iteration"],
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
             **extra,
         }
     )
@@ -108,10 +113,19 @@ def _log_node(state: WorkflowState, node: str, start: float, **extra) -> None:
 def parse_document(state: WorkflowState) -> WorkflowState:
     start = time.time()
     agent = DocumentParserAgent()
-    parsed = agent.parse(state["pdf_path"])
+    
+    with get_openai_callback() as cb:
+        parsed = agent.parse(state["pdf_path"])
+        p_tok = cb.prompt_tokens
+        c_tok = cb.completion_tokens
+        t_tok = cb.total_tokens
+        
     state["parsed_doc"] = parsed
     _log_node(
         state, "parse_document", start,
+        prompt_tokens=p_tok,
+        completion_tokens=c_tok,
+        total_tokens=t_tok,
         sections=len(parsed.sections),
         clauses=len(parsed.clauses),
     )
@@ -121,20 +135,36 @@ def parse_document(state: WorkflowState) -> WorkflowState:
 
 def retrieve_context(state: WorkflowState) -> WorkflowState:
     start = time.time()
+
+    # If this is a retry (risk_map has been populated from a previous iteration),
+    # increment iteration and adjust parameters in the persistent state.
+    if state.get("risk_map"):
+        state["iteration"] += 1
+        state["retrieval_k"] += 3
+        state["retrieval_threshold"] = max(0.10, state["retrieval_threshold"] - 0.10)
+        logger.info(
+            "[retrieve_context] Retry triggered. Adjusting parameters: iter=%d, k=%d, thr=%.2f",
+            state["iteration"],
+            state["retrieval_k"],
+            state["retrieval_threshold"],
+        )
+
     agent = RAGRetrievalAgent(
         persist_directory=PERSIST_DIR,
         threshold=state["retrieval_threshold"],
     )
     parsed = state["parsed_doc"]
 
-    # Bonus: parallel retrieval — all clauses retrieved simultaneously via thread pool.
-    # Cuts retrieval wall-time by ~60-70% on contracts with many clauses.
+    # Parallel retrieval
     context_map = agent.retrieve_many(parsed.clauses, k=state["retrieval_k"])
 
     state["context_map"] = context_map
     empty_count = sum(1 for v in context_map.values() if not v)
     _log_node(
         state, "retrieve_context", start,
+        prompt_tokens=0,
+        completion_tokens=0,
+        total_tokens=0,
         total_clauses=len(parsed.clauses),
         empty_retrievals=empty_count,
         k=state["retrieval_k"],
@@ -155,17 +185,45 @@ def assess_risk(state: WorkflowState) -> WorkflowState:
     agent = RiskAssessmentAgent()
     risk_map: dict[str, RiskAssessmentDTO] = {}
 
-    for clause in state["parsed_doc"].clauses:
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    total_total_tokens = 0
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    def assess_single(clause):
         chunks = state["context_map"].get(clause.id, [])
-        assessment = agent.assess(clause, chunks)
-        risk_map[clause.id] = assessment
+        with get_openai_callback() as cb:
+            assessment = agent.assess(clause, chunks)
+            return clause.id, assessment, cb.prompt_tokens, cb.completion_tokens, cb.total_tokens
+
+    clauses = state["parsed_doc"].clauses
+    max_workers = min(8, len(clauses)) if clauses else 1
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(assess_single, clause) for clause in clauses]
+        for fut in futures:
+            try:
+                cid, assessment, p_tok, c_tok, t_tok = fut.result()
+                risk_map[cid] = assessment
+                total_prompt_tokens += p_tok
+                total_completion_tokens += c_tok
+                total_total_tokens += t_tok
+            except Exception as exc:
+                logger.error("Error in parallel risk assessment: %s", exc)
 
     state["risk_map"] = risk_map
     counts = {level.value: 0 for level in RiskLevel}
     for a in risk_map.values():
         counts[a.risk_level.value] += 1
 
-    _log_node(state, "assess_risk", start, risk_distribution=counts)
+    _log_node(
+        state, "assess_risk", start,
+        prompt_tokens=total_prompt_tokens,
+        completion_tokens=total_completion_tokens,
+        total_tokens=total_total_tokens,
+        risk_distribution=counts
+    )
     logger.info("[assess_risk] distribution: %s", counts)
     return state
 
@@ -184,15 +242,10 @@ def quality_check(state: WorkflowState) -> str:
     ) / len(risk_map)
 
     if necunoscut_frac > NECUNOSCUT_THRESHOLD and state["iteration"] < MAX_ITER:
-        state["iteration"] += 1
-        state["retrieval_k"] += 3
-        state["retrieval_threshold"] = max(0.10, state["retrieval_threshold"] - 0.10)
         logger.info(
-            "[quality_check] %.0f%% NECUNOSCUT → retry (iter=%d, k=%d, thr=%.2f)",
+            "[quality_check] %.0f%% NECUNOSCUT → routing back to retrieve_context (current iter=%d)",
             necunoscut_frac * 100,
             state["iteration"],
-            state["retrieval_k"],
-            state["retrieval_threshold"],
         )
         return "retrieve_context"
 
@@ -210,7 +263,13 @@ def flag_high_risk(state: WorkflowState) -> WorkflowState:
         1 for a in state["risk_map"].values() if a.risk_level == RiskLevel.RIDICAT
     )
     state["high_risk_alert"] = high_risk_count > 0
-    _log_node(state, "flag_high_risk", start, high_risk_clauses=high_risk_count)
+    _log_node(
+        state, "flag_high_risk", start,
+        prompt_tokens=0,
+        completion_tokens=0,
+        total_tokens=0,
+        high_risk_clauses=high_risk_count
+    )
     if state["high_risk_alert"]:
         logger.warning("[flag_high_risk] %d RIDICAT clause(s) detected!", high_risk_count)
     return state
@@ -221,19 +280,48 @@ def generate_recommendations(state: WorkflowState) -> WorkflowState:
     agent = RecommendationAgent()
     recommendations: list[RecommendationDTO] = []
 
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    total_total_tokens = 0
+
+    from concurrent.futures import ThreadPoolExecutor
+
     clause_map = {c.id: c for c in state["parsed_doc"].clauses}
+    items_to_process = []
     for clause_id, risk in state["risk_map"].items():
         clause = clause_map.get(clause_id)
         if not clause:
             continue
         chunks = state["context_map"].get(clause_id, [])
-        rec = agent.recommend(clause, risk, chunks)
-        recommendations.append(rec)
+        items_to_process.append((clause, risk, chunks))
+
+    def recommend_single(item):
+        clause, risk, chunks = item
+        with get_openai_callback() as cb:
+            rec = agent.recommend(clause, risk, chunks)
+            return rec, cb.prompt_tokens, cb.completion_tokens, cb.total_tokens
+
+    max_workers = min(8, len(items_to_process)) if items_to_process else 1
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(recommend_single, item) for item in items_to_process]
+        for fut in futures:
+            try:
+                rec, p_tok, c_tok, t_tok = fut.result()
+                recommendations.append(rec)
+                total_prompt_tokens += p_tok
+                total_completion_tokens += c_tok
+                total_total_tokens += t_tok
+            except Exception as exc:
+                logger.error("Error in parallel recommendations: %s", exc)
 
     state["recommendations"] = recommendations
     reformulated = sum(1 for r in recommendations if r.reformulated_text)
     _log_node(
         state, "generate_recommendations", start,
+        prompt_tokens=total_prompt_tokens,
+        completion_tokens=total_completion_tokens,
+        total_tokens=total_total_tokens,
         total=len(recommendations),
         reformulated=reformulated,
     )
@@ -273,7 +361,13 @@ def compile_report(state: WorkflowState) -> WorkflowState:
     # Write run log
     os.makedirs("logs", exist_ok=True)
     log_path = f"logs/run_{timestamp}.json"
-    _log_node(state, "compile_report", start, report_path=report_path)
+    _log_node(
+        state, "compile_report", start,
+        prompt_tokens=0,
+        completion_tokens=0,
+        total_tokens=0,
+        report_path=report_path
+    )
     with open(log_path, "w", encoding="utf-8") as f:
         json.dump(state["node_log"], f, ensure_ascii=False, indent=2)
 

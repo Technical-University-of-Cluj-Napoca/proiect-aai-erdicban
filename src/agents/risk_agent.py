@@ -6,52 +6,36 @@ retrieved by RAGRetrievalAgent as grounding context.
 
 If context_chunks is empty, the agent returns NECUNOSCUT immediately
 without calling the LLM — a short-circuit that is explicit and logged.
-
-Prompt design notes:
-  - The system prompt instructs the model to cite ONLY sources visible
-    in the context string. This prevents hallucinated legislation.
-  - gpt-4o-mini is sufficient here: the task is classification +
-    extraction, not open-ended generation.
-  - SQLiteCache is used during development to avoid redundant API calls
-    when iterating on the prompt.
 """
 
 from __future__ import annotations
-import json
 import logging
 import os
-import re
 
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.globals import set_llm_cache
 from langchain_community.cache import SQLiteCache
+from langchain_core.output_parsers import JsonOutputParser
 
 from src.dtos import ClauseDTO, RetrievalResultDTO, RiskAssessmentDTO, RiskLevel
 
 logger = logging.getLogger(__name__)
 
-# Enable SQLite cache for development — prevents re-calling the API for
-# identical (prompt, model) pairs. Delete .langchain.db to clear.
+# Enable SQLite cache for development
 set_llm_cache(SQLiteCache(database_path=".langchain.db"))
 
 SYSTEM_PROMPT = """\
 Ești un expert juridic specializat în legislația română și europeană.
-Evaluează clauza contractuală furnizată pe baza EXCLUSIVĂ a fragmentelor \
-din corpus-ul juridic de mai jos.
+Evaluează clauza contractuală furnizată pe baza EXCLUSIVĂ a fragmentelor din corpus-ul juridic de mai jos.
 
 Reguli stricte:
 1. Citează NUMAI surse care apar explicit în contextul furnizat.
 2. Nu inventa articole de lege, regulamente sau hotărâri judecătorești.
 3. Dacă contextul nu acoperă clauza, returnează risk_level: "NECUNOSCUT".
-4. Răspunde EXCLUSIV cu un obiect JSON valid, fără text înainte sau după.
 
-Schema JSON de răspuns:
-{{
-  "risk_level": "RIDICAT" | "MEDIU" | "SCAZUT" | "CONFORM" | "NECUNOSCUT",
-  "issues": ["problemă 1 cu referință la sursă", "problemă 2 ..."],
-  "references": ["sursa_1.pdf", "sursa_2.pdf"]
-}}
+Formatul de răspuns trebuie să fie un obiect JSON valid, conform instrucțiunilor de mai jos.
+{format_instructions}
 """
 
 HUMAN_PROMPT = """\
@@ -79,11 +63,12 @@ class RiskAssessmentAgent:
             temperature=0,
             api_key=os.getenv("OPENAI_API_KEY"),
         )
+        self.parser = JsonOutputParser(pydantic_object=RiskAssessmentDTO)
         self.prompt = ChatPromptTemplate.from_messages([
             ("system", SYSTEM_PROMPT),
             ("human", HUMAN_PROMPT),
         ])
-        self.chain = self.prompt | self.llm
+        self.chain = self.prompt | self.llm | self.parser
 
     def assess(
         self,
@@ -112,17 +97,16 @@ class RiskAssessmentAgent:
         )
 
         try:
-            response = self.chain.invoke(
+            parsed = self.chain.invoke(
                 {
                     "legal_context": legal_context,
                     "clause_id": clause.id,
                     "clause_text": clause.text[:2000],
+                    "format_instructions": self.parser.get_format_instructions(),
                 }
             )
-            raw = response.content.strip()
-            raw = re.sub(r"```json|```", "", raw).strip()
-            parsed = json.loads(raw)
 
+            # JsonOutputParser returns parsed dictionary matching DTO fields
             return RiskAssessmentDTO(
                 clause_id=clause.id,
                 risk_level=RiskLevel(parsed.get("risk_level", "NECUNOSCUT")),
@@ -131,10 +115,8 @@ class RiskAssessmentAgent:
                 context_was_empty=False,
             )
 
-        except json.JSONDecodeError as exc:
-            logger.error("JSON parse error for clause %s: %s", clause.id, exc)
         except Exception as exc:
-            logger.error("Risk assessment failed for clause %s: %s", clause.id, exc)
+            logger.error("Risk assessment failed or JSON parsing error for clause %s: %s", clause.id, exc)
 
         # Safe fallback — never crash
         return RiskAssessmentDTO(

@@ -39,22 +39,63 @@ def _infer_doc_type(rel_path: str) -> str:
     return "other"
 
 
-def _extract_text_from_pdf(pdf_path: Path) -> tuple[str, int]:
+def extract_text_with_ocr_fallback(pdf_path: Path | str) -> list[str]:
     """
-    Extract plain text and page count from a PDF using pdfplumber.
-    Returns (text, page_count). Falls back to empty string on error.
+    Extract text page-by-page from a PDF. If the extracted text is empty
+    or too short (scanned PDF), falls back to OCR via pypdfium2 and tesseract.
     """
+    import pypdfium2 as pdfium
+    import tempfile
+    import subprocess
+
+    pages_text: list[str] = []
     try:
         with pdfplumber.open(pdf_path) as pdf:
-            pages = []
             for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    pages.append(page_text)
-            return "\n\n".join(pages), len(pdf.pages)
+                text = page.extract_text() or ""
+                pages_text.append(text)
     except Exception as exc:
-        logger.warning("Could not extract text from %s: %s", pdf_path, exc)
-        return "", 0
+        logger.warning("Normal text extraction failed for %s: %s. Trying direct OCR fallback.", pdf_path, exc)
+        pages_text = []
+
+    total_len = sum(len(p.strip()) for p in pages_text)
+    if total_len < 50:
+        logger.info("Extracted text is empty or very short (%d chars). Falling back to OCR using pypdfium2 + tesseract...", total_len)
+        pages_text = []
+        try:
+            doc = pdfium.PdfDocument(str(pdf_path))
+            for i, page in enumerate(doc):
+                image = page.render(scale=2).to_pil()
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_file:
+                    tmp_img_path = tmp_file.name
+                try:
+                    image.save(tmp_img_path)
+                    tess_cmd = "/opt/homebrew/bin/tesseract" if os.path.exists("/opt/homebrew/bin/tesseract") else "tesseract"
+                    res = subprocess.run(
+                        [tess_cmd, tmp_img_path, "stdout", "-l", "eng"],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    )
+                    ocr_text = res.stdout or ""
+                    pages_text.append(ocr_text)
+                    logger.info("OCR completed for page %d: %d chars extracted", i + 1, len(ocr_text))
+                finally:
+                    if os.path.exists(tmp_img_path):
+                        os.remove(tmp_img_path)
+        except Exception as ocr_exc:
+            logger.error("OCR fallback failed for %s: %s", pdf_path, ocr_exc)
+
+    return pages_text
+
+
+def _extract_text_from_pdf(pdf_path: Path) -> tuple[str, int]:
+    """
+    Extract plain text and page count from a PDF using OCR fallback.
+    Returns (text, page_count).
+    """
+    pages = extract_text_with_ocr_fallback(pdf_path)
+    return "\n\n".join(pages), len(pages)
 
 
 def load_corpus(corpus_dir: str | Path) -> list[CorpusDocument]:
